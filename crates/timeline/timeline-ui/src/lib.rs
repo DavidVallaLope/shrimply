@@ -46,6 +46,7 @@ use shrimply_core::timeline_value::{TimelineBool, TimelineValue};
 use shrimply_timeline::{TrackGap, TrackKey};
 
 mod audio_meter;
+mod scheme;
 mod beat_grid;
 mod clipboard;
 mod context_menu;
@@ -364,7 +365,7 @@ pub fn new(
         let painter = match runtime.renderer.begin_frame(
             screen_size_px,
             pixels_per_point,
-            Color::VIEW_BG_DARK,
+            crate::scheme::view_bg(),
         ) {
             Ok(painter) => painter,
             Err(error) => {
