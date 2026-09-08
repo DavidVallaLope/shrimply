@@ -96,6 +96,7 @@ FEDORA_PACKAGES := \
 	clang-devel \
 	cmake \
 	gcc-c++ \
+	gcc15-c++ \
 	lld \
 	ninja-build \
 	opencv-devel \

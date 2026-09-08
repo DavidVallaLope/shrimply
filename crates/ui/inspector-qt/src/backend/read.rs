@@ -534,7 +534,8 @@ impl qobject::InspectorBackend {
                 ControlKind::LayeredText => QtKind::LayeredText,
                 ControlKind::LayeredDrawing => QtKind::LayeredDrawing,
                 ControlKind::FontFamilies => QtKind::FontFamilies,
-                ControlKind::Selector
+                ControlKind::VoiceModel
+                | ControlKind::Selector
                 | ControlKind::OptionalSelector
                 | ControlKind::OptionalNumberSelector => QtKind::Selector,
                 ControlKind::Vector2 => QtKind::Vector2,
