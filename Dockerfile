@@ -39,13 +39,17 @@ RUN test -e external/slang/CMakeLists.txt || { \
         exit 1; \
     }
 
-RUN cmake -S external/slang -B external/slang/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSLANG_ENABLE_SLANG_RHI=OFF && \
-    cmake --build external/slang/build --target slangc slang-glslang
+# Conflicts with the slang build that `make release qt-release` performs itself via Makefile:129-135: 
+# RUN cmake -S external/slang -B external/slang/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSLANG_ENABLE_SLANG_RHI=OFF -DSLANG_ENABLE_TESTS=OFF && \
+#     cmake --build external/slang/build --target slangc slang-glslang
 ENV CUDA_HOME=/usr/local/cuda
 ENV CUDA_TOOLKIT_PATH=/usr/local/cuda
 
-# We have to do this to compile since Docker doesnt have a nvidia driver. 
+# We have to do this to compile since Docker doesnt have a nvidia driver.
 RUN ln -sf libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+# LIBRARY_PATH is what the linker consults for `-lcuda` at compile time;
+# LD_LIBRARY_PATH only affects the runtime dynamic loader.
+ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH}
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH}
 
 RUN make release qt-release
