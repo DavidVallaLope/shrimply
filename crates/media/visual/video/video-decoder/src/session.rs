@@ -11,7 +11,7 @@ use shrimply_math_core::{Fraction, fraction_ratio_i128};
 use shrimply_project_document::project::Time;
 use shrimply_visual_frame::{GPU_FRAME_ALLOCATION_EXHAUSTED, VisualFrame, ffmpeg_cuda_context};
 
-use crate::startup::DecoderStartupMeasurement;
+use crate::lifecycle::DecoderStartupMeasurement;
 use crate::track::VideoSource;
 use crate::{LOCAL_FORWARD_DECODE_SECONDS, MAX_NONADVANCING_FRAMES};
 
@@ -283,8 +283,16 @@ impl VideoDecoderSession {
 
         let maximum_forward_gap =
             (!continuous).then_some(Time::from_seconds(LOCAL_FORWARD_DECODE_SECONDS));
+        // Cancellation can discard the candidate preceding a retained lookahead frame. Without
+        // that candidate, decoding forward from beyond the target would return lookahead forever.
+        let backward_tolerance =
+            if cached_frame(candidate.as_ref(), position, self.frame_duration).is_some() {
+                self.frame_duration
+            } else {
+                Time::ZERO
+            };
         if !continuing_active_seek
-            && !self.can_decode_forward(position, self.frame_duration, maximum_forward_gap)
+            && !self.can_decode_forward(position, backward_tolerance, maximum_forward_gap)
         {
             self.seek(position)?;
             candidate = candidate.filter(|frame| frame.0 <= position);
@@ -411,6 +419,7 @@ impl VideoDecoderSession {
             match self.receive_frame()? {
                 ReceiveState::Frame(frame) => {
                     if self.cancel_if_superseded(controls) {
+                        self.lookahead = Some(frame);
                         return Ok(NextFrame::Superseded);
                     }
                     return Ok(NextFrame::Frame(frame));
@@ -622,7 +631,7 @@ impl VideoDecoderSession {
         self.startup
             .take()
             .expect("first CUDA frame arrived without a startup reservation")
-            .finish(None, &mut self.startup_bytes);
+            .record(None, &mut self.startup_bytes);
         self.initialized = true;
 
         unsafe {

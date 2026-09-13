@@ -278,20 +278,12 @@ where
         ) > reserved
     }
 
-    pub fn retire_idle(&self) {
+    /// Queues idle decoder reclamation. Only blocking memory-pressure retries wait for the
+    /// returned completion; real-time rendering drops it and continues submitting work.
+    pub fn reclaim_idle(&self) -> std::sync::mpsc::Receiver<()> {
         let mut state = self.state.lock().expect("decoder pool mutex poisoned");
         state.trim_idle_to_limit(0);
-    }
-
-    /// Releases idle decoders before a blocking memory-pressure retry. Never wait while holding
-    /// the scheduling mutex: foreground requests must remain able to submit work.
-    pub fn reclaim_idle(&self) {
-        let completion = {
-            let mut state = self.state.lock().expect("decoder pool mutex poisoned");
-            state.trim_idle_to_limit(0);
-            state.retirement.barrier()
-        };
-        completion.recv().expect("decoder retirement worker stopped before reclamation completed");
+        state.retirement.barrier()
     }
 
     pub fn evict_idle_owners(&self, mut evict: impl FnMut(&O, &S) -> bool) {

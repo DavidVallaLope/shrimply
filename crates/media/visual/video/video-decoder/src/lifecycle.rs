@@ -13,77 +13,118 @@ pub fn is_decoder_startup_pressure(error: &str) -> bool {
 
 #[derive(Clone, Default)]
 pub(crate) struct VideoDecoderContext {
-    startup: Arc<DecoderStartupGate>,
+    lifecycle: Arc<DecoderLifecycle>,
 }
 
 #[derive(Default)]
-struct DecoderStartupGate {
-    state: Mutex<DecoderStartupState>,
+struct DecoderLifecycle {
+    state: Mutex<DecoderLifecycleState>,
     ready: Condvar,
 }
 
 #[derive(Default)]
-struct DecoderStartupState {
+struct DecoderLifecycleState {
     active: bool,
+    foreground_waiters: usize,
     observed_bytes: u64,
 }
 
-pub(crate) struct DecoderStartupMeasurement {
-    startup: Arc<DecoderStartupGate>,
-    free_before: u64,
-    speculative: bool,
-    finished: bool,
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum DecoderPriority {
+    Speculative,
+    Foreground,
+    Required,
+    Retirement,
 }
 
-impl Drop for DecoderStartupMeasurement {
+pub(crate) struct DecoderPermit {
+    lifecycle: Arc<DecoderLifecycle>,
+}
+
+impl Drop for DecoderPermit {
     fn drop(&mut self) {
         let mut state = self
-            .startup
+            .lifecycle
             .state
             .lock()
-            .expect("video decoder startup mutex poisoned");
-        if !self.finished {
-            state.active = false;
-            self.startup.ready.notify_all();
-        }
+            .expect("video decoder lifecycle mutex poisoned");
+        state.active = false;
+        self.lifecycle.ready.notify_all();
     }
 }
 
+pub(crate) struct DecoderStartupMeasurement {
+    permit: DecoderPermit,
+    free_before: u64,
+    speculative: bool,
+}
+
 impl VideoDecoderContext {
-    pub(crate) fn begin_startup(
+    /// Reserves a lifecycle operation without holding the bookkeeping mutex while it runs.
+    /// Foreground startup takes precedence over queued cleanup and speculative startup.
+    pub(crate) fn reserve(
         &self,
-        source: &VideoSource,
-        required: bool,
+        priority: DecoderPriority,
         controls: DecodeControls<'_>,
-        retained_bytes: u64,
-    ) -> Result<Option<DecoderStartupMeasurement>, String> {
+    ) -> Option<DecoderPermit> {
         let mut state = self
-            .startup
+            .lifecycle
             .state
             .lock()
-            .expect("video decoder startup mutex poisoned");
-        while state.active {
-            if !required
-                || controls
+            .expect("video decoder lifecycle mutex poisoned");
+        let foreground = matches!(
+            priority,
+            DecoderPriority::Foreground | DecoderPriority::Required
+        );
+        if priority == DecoderPriority::Speculative {
+            if state.active || state.foreground_waiters > 0 {
+                return None;
+            }
+        } else {
+            state.foreground_waiters += usize::from(foreground);
+            while (state.active || (!foreground && state.foreground_waiters > 0))
+                && !controls
                     .into_iter()
                     .flatten()
                     .any(DecodeControl::superseded)
             {
-                return Ok(None);
+                state = self
+                    .lifecycle
+                    .ready
+                    .wait(state)
+                    .expect("video decoder lifecycle mutex poisoned");
             }
-            state = self
-                .startup
-                .ready
-                .wait(state)
-                .expect("video decoder startup mutex poisoned");
+            state.foreground_waiters -= usize::from(foreground);
+            self.lifecycle.ready.notify_all();
         }
         if controls
             .into_iter()
             .flatten()
             .any(DecodeControl::superseded)
         {
-            return Ok(None);
+            return None;
         }
+        state.active = true;
+        Some(DecoderPermit {
+            lifecycle: self.lifecycle.clone(),
+        })
+    }
+
+    pub(crate) fn begin_startup(
+        &self,
+        source: &VideoSource,
+        priority: DecoderPriority,
+        controls: DecodeControls<'_>,
+        retained_bytes: u64,
+    ) -> Result<Option<DecoderStartupMeasurement>, String> {
+        let Some(permit) = self.reserve(priority, controls) else {
+            return Ok(None);
+        };
+        let state = self
+            .lifecycle
+            .state
+            .lock()
+            .expect("video decoder lifecycle mutex poisoned");
         let (free, total) = cuda_memory_info()?;
         let free = u64::try_from(free).map_err(|_| "CUDA free memory exceeds u64".to_string())?;
         let total =
@@ -93,7 +134,7 @@ impl VideoDecoderContext {
             .ok_or_else(|| "video decoder startup memory requirement overflowed".to_string())?;
         if free < required_free {
             trace_startup_throttled(source, free, total, required_free, &state);
-            if required {
+            if priority == DecoderPriority::Required {
                 return Err(format!(
                     "{DECODER_STARTUP_MEMORY_EXHAUSTED}: free={free}, required={required_free}"
                 ));
@@ -101,18 +142,16 @@ impl VideoDecoderContext {
             crate::report_decoder_pressure(state.observed_bytes);
             return Ok(None);
         }
-        state.active = true;
         Ok(Some(DecoderStartupMeasurement {
-            startup: self.startup.clone(),
+            permit,
             free_before: free,
-            speculative: !required,
-            finished: false,
+            speculative: priority != DecoderPriority::Required,
         }))
     }
 }
 
 impl DecoderStartupMeasurement {
-    pub(crate) fn finish(mut self, error: Option<&str>, retained_bytes: &mut u64) -> bool {
+    pub(crate) fn record(&self, error: Option<&str>, retained_bytes: &mut u64) -> bool {
         let memory_after = cuda_memory_info()
             .and_then(|(free, total)| {
                 Ok((
@@ -127,10 +166,11 @@ impl DecoderStartupMeasurement {
             })
             .ok();
         let mut state = self
-            .startup
+            .permit
+            .lifecycle
             .state
             .lock()
-            .expect("video decoder startup mutex poisoned");
+            .expect("video decoder lifecycle mutex poisoned");
         let pressure_failure = error.is_some_and(|error| {
             error.contains("out of memory")
                 || error.contains("OUT_OF_MEMORY")
@@ -155,9 +195,6 @@ impl DecoderStartupMeasurement {
         if pressure_failure && self.speculative {
             crate::report_decoder_pressure(u64::MAX);
         }
-        state.active = false;
-        self.finished = true;
-        self.startup.ready.notify_all();
         pressure_failure
     }
 }
@@ -167,7 +204,7 @@ fn trace_startup_throttled(
     free: u64,
     total: u64,
     required: u64,
-    state: &DecoderStartupState,
+    state: &DecoderLifecycleState,
 ) {
     shrimply_profiling::increment("Temporal decoder / Starts throttled by GPU pressure");
     tracing::trace!(

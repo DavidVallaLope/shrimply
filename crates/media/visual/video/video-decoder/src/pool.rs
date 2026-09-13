@@ -13,8 +13,8 @@ use shrimply_project_document::project::{
 use shrimply_visual_frame::GPU_FRAME_ALLOCATION_EXHAUSTED;
 use uuid::Uuid;
 
+use crate::lifecycle::{DECODER_STARTUP_MEMORY_EXHAUSTED, DecoderPriority, VideoDecoderContext};
 use crate::session::{DecodeControl, DecodeOutcome, DecodedVisual, VideoDecoderSession};
-use crate::startup::{DECODER_STARTUP_MEMORY_EXHAUSTED, VideoDecoderContext};
 use crate::track::{VideoDecoderOwner, VideoPlane, VideoSource};
 use crate::{
     DEFAULT_VIDEO_DECODER_POOL_SIZE, MAX_HANDOFF_FORWARD_FRAMES,
@@ -42,6 +42,7 @@ struct DecoderWork {
     control: Option<DecodeControl>,
     mode: DecodeMode,
     force_seek: bool,
+    foreground: bool,
     revision: u64,
     reply: Option<SyncSender<Result<DecodeOutcome, String>>>,
     _activity: Option<DecoderActivityGuard>,
@@ -130,6 +131,7 @@ struct VideoDecoderRequest {
     control: Option<DecodeControl>,
     mode: DecodeMode,
     latest: bool,
+    foreground: bool,
 }
 
 impl PendingDecode {
@@ -252,6 +254,7 @@ impl PooledVideoDecoder {
                         control,
                         mode,
                         force_seek,
+                        foreground,
                         revision,
                         reply,
                         _activity,
@@ -286,7 +289,13 @@ impl PooledVideoDecoder {
                         if decoder.as_ref().is_none_or(|decoder| !decoder.initialized) {
                             let Some(startup) = worker_context.begin_startup(
                                 &worker_source,
-                                !latest,
+                                if !latest {
+                                    DecoderPriority::Required
+                                } else if foreground {
+                                    DecoderPriority::Foreground
+                                } else {
+                                    DecoderPriority::Speculative
+                                },
                                 controls,
                                 decoder.as_ref().map_or(0, |decoder| decoder.startup_bytes),
                             )?
@@ -314,7 +323,7 @@ impl PooledVideoDecoder {
                                     }
                                     Err(error) => {
                                         startup_pressure_failure =
-                                            startup.finish(Some(&error), &mut 0);
+                                            startup.record(Some(&error), &mut 0);
                                         return Err(error);
                                     }
                                 }
@@ -328,13 +337,20 @@ impl PooledVideoDecoder {
                     })();
                     // The session releases the gate on its first CUDA frame. Cancellation or
                     // failure before that point releases it here, retaining healthy session state.
-                    if let Some(decoder) = decoder.as_mut()
-                        && let Some(startup) = decoder.startup.take()
-                    {
-                        startup_pressure_failure = startup.finish(
+                    let startup = decoder.as_mut().and_then(|decoder| decoder.startup.take());
+                    if let Some(startup) = startup {
+                        startup_pressure_failure = startup.record(
                             result.as_ref().err().map(String::as_str),
-                            &mut decoder.startup_bytes,
+                            &mut decoder
+                                .as_mut()
+                                .expect("startup decoder missing")
+                                .startup_bytes,
                         );
+                        if startup_pressure_failure {
+                            // Keep the startup permit until the failed session has freed its
+                            // resources; another allocation must not overtake this recovery.
+                            decoder = None;
+                        }
                     }
                     if startup_pressure_failure
                         && let Err(error) = &result
@@ -343,7 +359,6 @@ impl PooledVideoDecoder {
                         result = Err(format!("{DECODER_STARTUP_MEMORY_EXHAUSTED}: {error}"));
                     }
                     if startup_pressure_failure {
-                        decoder = None;
                         *worker_metadata
                             .lock()
                             .expect("video decoder metadata mutex poisoned") = DecoderMetadata {
@@ -463,6 +478,15 @@ impl PooledVideoDecoder {
                         break;
                     }
                 }
+                let _permit = worker_context
+                    .reserve(DecoderPriority::Retirement, [None, None])
+                    .expect("decoder cleanup reservation cancelled");
+                drop(decoder);
+                let mut current = worker_current
+                    .lock()
+                    .expect("video decoder current frame mutex poisoned");
+                replace_current_frame(current.as_ref(), None);
+                current.take();
             })
             .map_err(|error| format!("spawn video decoder worker: {error}"))?;
         Ok(Self {
@@ -486,6 +510,7 @@ impl PooledVideoDecoder {
             control,
             mode,
             latest,
+            foreground,
         } = request;
         let maximum_latest_distance = {
             let metadata = self
@@ -516,6 +541,9 @@ impl PooledVideoDecoder {
                 mode,
                 generation,
             };
+            if let Some(work) = state.latest.as_mut() {
+                work.foreground |= foreground;
+            }
             if state.latest.as_ref().is_some_and(|work| {
                 work.owner == owner
                     && work.position == position
@@ -559,6 +587,7 @@ impl PooledVideoDecoder {
                 control,
                 mode,
                 force_seek: !adjacent,
+                foreground,
                 revision,
                 reply: None,
                 _activity: Some(activity),
@@ -586,6 +615,7 @@ impl PooledVideoDecoder {
             control,
             mode,
             force_seek: false,
+            foreground,
             revision,
             reply: Some(reply),
             _activity: None,
@@ -634,12 +664,6 @@ impl Drop for PooledVideoDecoder {
             .expect("video decoder worker missing during shutdown")
             .join()
             .expect("video decoder worker panicked during shutdown");
-        let mut current = self
-            .current
-            .lock()
-            .expect("video decoder current frame mutex poisoned");
-        replace_current_frame(current.as_ref(), None);
-        current.take();
     }
 }
 
@@ -819,12 +843,8 @@ impl VideoDecoderPool {
         self.decoders.len()
     }
 
-    pub fn reclaim_idle(&mut self) {
-        self.decoders.reclaim_idle();
-    }
-
-    pub fn retire_idle(&mut self) {
-        self.decoders.retire_idle();
+    pub fn reclaim_idle(&mut self) -> Receiver<()> {
+        self.decoders.reclaim_idle()
     }
 }
 
@@ -926,6 +946,7 @@ impl VideoDecoderHandle {
                 control: request.control,
                 mode: request.mode,
                 latest: false,
+                foreground: true,
             },
         )
     }
@@ -947,6 +968,7 @@ impl VideoDecoderHandle {
                 control: request.control,
                 mode: request.mode,
                 latest: false,
+                foreground,
             },
         )
     }
@@ -966,6 +988,7 @@ impl VideoDecoderHandle {
                     control: request.control,
                     mode: request.mode,
                     latest: true,
+                    foreground,
                 },
             )
             .map(|request| request.is_some())

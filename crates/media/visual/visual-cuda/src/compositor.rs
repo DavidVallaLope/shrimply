@@ -775,7 +775,11 @@ impl VideoExportRenderer {
             .any(|error| crate::decode::is_decoder_startup_pressure(error))
         {
             let _ = crate::decode::take_decoder_pressure();
-            self.sessions.decoders.reclaim_idle();
+            self.sessions
+                .decoders
+                .reclaim_idle()
+                .recv()
+                .expect("decoder reclamation failed before export retry");
             match self
                 .compositor
                 .relieve_all_gpu_pressure("export video decoder startup retry")
@@ -1095,7 +1099,11 @@ fn video_compositor_worker(
                 {
                     compositor.set_render_control(Some(decode_control.clone()));
                     let _ = crate::decode::take_decoder_pressure();
-                    sessions.decoders.reclaim_idle();
+                    sessions
+                        .decoders
+                        .reclaim_idle()
+                        .recv()
+                        .expect("decoder reclamation failed before accurate preview retry");
                     match compositor.relieve_all_gpu_pressure("video decoder startup retry") {
                         Ok(()) if !decode_control.superseded() => {
                             shrimply_profiling::increment(
@@ -1237,7 +1245,7 @@ fn video_compositor_worker(
                     && let Some(startup_bytes) = crate::decode::take_decoder_pressure()
                 {
                     compositor.set_render_control(Some(decode_control.clone()));
-                    sessions.decoders.retire_idle();
+                    drop(sessions.decoders.reclaim_idle());
                     if let Err(error) = compositor.relieve_decoder_gpu_pressure(startup_bytes) {
                         tracing::warn!(
                             %error,
