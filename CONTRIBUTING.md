@@ -2,7 +2,7 @@
 
 Contributions of code, documentation, translations, and other improvements are welcome.
 
-## AI-assisted contributions
+## AI Policy
 
 AI-assisted contributions are welcome. However, you are responsible for understanding,
 reviewing, and testing everything you submit.
